@@ -4,8 +4,8 @@ pakdrift — patch-drift detection for Unreal Engine IoStore PAK mods.  v3.
 
     pakdrift --mod '<game>/.../Paks/~mods/Name' --game '<game>/.../Paks'
     pakdrift --build-index --game '<Paks>'        # cache the game's package index
-    pakdrift --snapshot '<Paks>' --out pre.json   # record package name+hash BEFORE a patch
-    pakdrift --compare-snapshot pre.json '<Paks>' # AFTER a patch: what changed under you?
+    pakdrift --snapshot '<Paks>' --out pre.json   # record the package SET before a patch
+    pakdrift --compare-snapshot pre.json '<Paks>' # AFTER a patch: what appeared/vanished?
     pakdrift --self-test
     pakdrift --version
 
@@ -14,17 +14,23 @@ WHAT IT ANSWERS, in two questions:
   1. NAME-LEVEL (--mod/--game): after the game patches, does a mod still aim at packages
      that exist, or is it aimed at packages the game renamed or removed?
 
-  2. CONTENT-LEVEL (--snapshot / --compare-snapshot): a package can KEEP its name and still
-     change its internals — the mod then loads and renders wrong, with no name anywhere
-     missing. This compares the package's CONTENT FINGERPRINT (its IoHash, read from the
-     IoStore chunk id, which is content-derived) before and after a patch, so a package whose
-     bytes changed under a mod is caught even though its name still resolves.
+  2. EXISTENCE-LEVEL (--snapshot / --compare-snapshot): diff the SET of packages the game
+     ships before vs after a patch, so packages a patch ADDED or REMOVED are named even when
+     you are not looking at one mod. (NOT a content compare — see the limit note below.)
+
+★ MEASURED LIMIT, and it corrects an earlier overclaim of this tool: the per-package id retoc
+  exposes (packagedata[].id) is the PACKAGE CHUNK ID, and its leading bytes are a hash of the
+  package NAME, not of its contents. Proof: the mod DaffodildNude ships a package whose chunk id
+  is e7a48aaee5ac67.. with 5,127,072 bytes, while the installed game ships the SAME id with
+  1,122,463 bytes — different bytes, identical id. So a same-id/same-hash read is GUARANTEED for
+  any package that keeps its name, and can NEVER see an internal change. A true content compare
+  must EXTRACT chunk bytes (retoc get) and hash them — that is the upgrade path, not shipped here.
 
 HOW IT READS A CONTAINER (the honest mechanism):
   It shells out to `retoc manifest <file.utoc>`, which parses the IoStore directory index and
-  returns each entry's PACKAGE NAME plus its chunk id. The chunk id's leading 8 bytes are the
-  package's IoHash (the container version here is `ReplaceIoChunkHashWithIoHash`, so the chunk
-  id carries the content hash directly). NTE's containers are AES-encrypted, so `retoc` is
+  returns each entry's PACKAGE NAME plus its chunk id. The chunk id's leading bytes are a hash
+  of the NAME (see the measured limit above), so it is used here only to identify a package,
+  never to judge its contents. NTE's containers are AES-encrypted, so `retoc` is
   called with the game's AES key (--aes-key, or $PAKDRIFT_AES_KEY).
 
 THREE VERDICTS, and the third is the important one:
@@ -49,7 +55,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "3.0"
+VERSION = "3.1"
 INDEX_CACHE = os.path.expanduser("~/.cache/pakdrift/game-index.json")
 
 
@@ -100,10 +106,9 @@ def utoc_files(root):
 
 
 def _chunk_hash(entry):
-    """The content fingerprint of one package entry: the leading 8 bytes (16 hex chars) of its
-    ExportBundleData chunk id, which under `ReplaceIoChunkHashWithIoHash` IS the package's
-    IoHash — content-derived, so a changed package yields a changed fingerprint even though its
-    NAME is unchanged. Falls back to the bulk-data chunk id if there is no export chunk."""
+    """The ID of one package entry: the leading bytes (hex) of its ExportBundleData chunk id.
+    ★ This is NAME-derived, NOT content-derived (measured 2026-10-08). It identifies a package;
+    it does NOT fingerprint its bytes. Do not use it to claim a package changed internally."""
     pack = entry.get("packagedata") or []
     if pack and pack[0].get("id"):
         return pack[0]["id"][:16]
@@ -230,22 +235,23 @@ def verdict(mod_names, game_names):
 
 
 def compare_hashes(before, after):
-    """CONTENT-LEVEL: which packages changed bytes or vanished under a patch?
+    """EXISTENCE-LEVEL: which packages appeared or vanished under a patch?
 
-    `before` and `after` are {name: hash} maps. A package that kept its name but changed its
-    hash is CHANGED; one that is gone is REMOVED. An added package is not drift (it cannot
-    break a mod built against the old game)."""
+    `before` and `after` are {name: id} maps, and only the NAME SET is compared — the id is
+    name-derived and cannot distinguish content (see the measured limit in the module docstring).
+    A package present before and gone now is REMOVED; one new now is ADDED (not drift, it cannot
+    break a mod built against the old game). 'changed' is retained in the return for callers but
+    is ALWAYS empty by construction — this tool does not detect internal changes."""
     if not before:
         raise Unreadable("snapshot carries no packages — refusing to call that clean")
     if not after:
         raise Unreadable("current container carries no packages — refusing to call that clean")
-    changed = sorted(n for n, h in before.items() if n in after and after[n] != h)
     removed = sorted(n for n in before if n not in after)
     added = sorted(n for n in after if n not in before)
     return {
         "before": len(before), "after": len(after),
-        "changed": changed, "removed": removed, "added": added,
-        "clean": not (changed or removed),
+        "changed": [], "removed": removed, "added": added,
+        "clean": not removed,
     }
 
 
@@ -275,21 +281,17 @@ def emit_hashes(res, snap_path):
     print()
     print(f"  packages then                 {res['before']}")
     print(f"  packages now                  {res['after']}")
-    print(f"  ... CONTENT CHANGED           {len(res['changed'])}")
-    print(f"  ... REMOVED                   {len(res['removed'])}")
-    print(f"  ... added (not drift)         {len(res['added'])}")
-    if res["changed"] or res["removed"]:
+    print(f"  ... REMOVED (existed before, gone now)   {len(res['removed'])}")
+    print(f"  ... added   (new now, not drift)         {len(res['added'])}")
+    if res["removed"]:
         print()
-        for n in res["changed"][:40]:
-            print(f"    CHANGED  {n}")
         for n in res["removed"][:40]:
             print(f"    REMOVED  {n}")
-        extra = len(res["changed"]) + len(res["removed"]) - min(len(res["changed"]), 40) - min(len(res["removed"]), 40)
-        if extra > 0:
-            print(f"    ... and {extra} more")
+        if len(res["removed"]) > 40:
+            print(f"    ... and {len(res['removed']) - 40} more")
         print()
-        print("VERDICT: DRIFT — a package kept its name but changed bytes (or vanished) under the patch.")
-        print("         Any mod built against the old bytes may now load and render wrong.")
+        print("VERDICT: DRIFT — a package the game shipped before is gone now.")
+        print("         (Name/existence only: an internal change is NOT detected — see the limit note.)")
         return 1
     print()
     print("VERDICT: RESOLVES — no package changed bytes or vanished vs the snapshot.")
@@ -322,32 +324,31 @@ def self_test():
     except Unreadable:
         print("pass: empty mod is UNKNOWN, not clean")
 
-    # CONTENT-LEVEL: a package that KEEPS its name but changes its hash MUST be caught.
-    before = {"/Game/A/x": "aaaa1111aaaa1111", "/Game/B/z": "bbbb2222bbbb2222"}
-    after_clean = dict(before)
-    after_drift = {"/Game/A/x": "cccc3333cccc3333", "/Game/B/z": "bbbb2222bbbb2222"}
-    rc = compare_hashes(before, after_clean)
+    # EXISTENCE-LEVEL: same name set reports clean; the id is NOT consulted for content.
+    before = {"/Game/A/x": "id-a", "/Game/B/z": "id-b"}
+    rc = compare_hashes(before, dict(before))
     if rc["clean"]:
-        print("pass: content-level unchanged reports RESOLVES")
+        print("pass: existence-level, unchanged set reports RESOLVES")
     else:
-        print(f"FAIL: content-level unchanged -> {rc}"); ok = False
-    rd = compare_hashes(before, after_drift)
-    if not rd["clean"] and rd["changed"] == ["/Game/A/x"] and rd["removed"] == []:
-        print("pass: content-level catches a same-name hash change (the whole point of v3)")
+        print(f"FAIL: existence-level unchanged -> {rc}"); ok = False
+    # a same-name, different-id pair must NOT be reported as any change (the corrected behaviour)
+    rd = compare_hashes(before, {"/Game/A/x": "totally-different-id", "/Game/B/z": "id-b"})
+    if rd["clean"] and rd["changed"] == []:
+        print("pass: a same-name/different-id pair is NOT called a change (the corrected limit)")
     else:
-        print(f"FAIL: content-level hash change -> {rd}"); ok = False
+        print(f"FAIL: same-name/different-id -> {rd}"); ok = False
 
-    # CONTENT-LEVEL: a removed package is drift, an added one is not.
-    rrm = compare_hashes(before, {"/Game/A/x": "aaaa1111aaaa1111"})
+    # a removed package is drift, an added one is not.
+    rrm = compare_hashes(before, {"/Game/A/x": "id-a"})
     if not rrm["clean"] and rrm["removed"] == ["/Game/B/z"]:
-        print("pass: content-level flags a removed package")
+        print("pass: existence-level flags a removed package")
     else:
-        print(f"FAIL: content-level removal -> {rrm}"); ok = False
-    radd = compare_hashes(before, {**before, "/Game/New/n": "dddd4444dddd4444"})
+        print(f"FAIL: existence-level removal -> {rrm}"); ok = False
+    radd = compare_hashes(before, {**before, "/Game/New/n": "id-n"})
     if radd["clean"] and radd["added"] == ["/Game/New/n"]:
-        print("pass: content-level ignores an ADDED package (not drift)")
+        print("pass: existence-level ignores an ADDED package (not drift)")
     else:
-        print(f"FAIL: content-level added -> {radd}"); ok = False
+        print(f"FAIL: existence-level added -> {radd}"); ok = False
 
     # a missing retoc must be UNKNOWN, not a crash and not a pass
     try:

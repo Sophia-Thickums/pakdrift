@@ -1,41 +1,56 @@
 # pakdrift
 
-**After your game patches, does your mod still point at things that exist — and are those things still the same things?**
+**After your game patches, does your mod still point at things that exist?**
 
-`pakdrift` answers two questions about an Unreal Engine 5 IoStore mod (`~mods/Name/*.utoc`)
-against the game you actually have installed.
+`pakdrift` answers one question about an Unreal Engine 5 IoStore mod (`~mods/Name/*.utoc`)
+against the game you actually have installed: **does every package the mod ships still exist
+in the game, or is it now aimed at packages the patch renamed or removed?**
 
-1. **Name-level** — does every package the mod ships still exist in the game, or is it now
-   aimed at packages the patch renamed or removed?
+That is the common patch-drift failure, and it is usually invisible until the game crashes
+or an outfit renders wrong.
 
-       pakdrift --build-index --game '<game>/Client/.../Content/Paks'
-       pakdrift --mod '<...>/Paks/~mods/SomeMod' --game '<...>/Paks'
+    pakdrift --build-index --game '<game>/Client/.../Content/Paks'
+    pakdrift --mod '<...>/Paks/~mods/SomeMod' --game '<...>/Paks'
 
-2. **Content-level** — a package can *keep its name* and still change its internals. The mod
-   then loads and renders wrong, with **no name anywhere missing**. Snapshot the game before a
-   patch, compare after:
+There is also a snapshot mode that diffs the SET of packages before and after a patch, so a
+package a patch *removed or added* is named even when you are not looking at one mod:
 
-       pakdrift --snapshot '<...>/Paks' --out pre-patch.json     # BEFORE the patch
-       pakdrift --compare-snapshot pre-patch.json '<...>/Paks'   # AFTER the patch
-
-   The comparison is on each package's **content fingerprint** (its IoHash, read from the
-   IoStore chunk id, which is content-derived) — so a changed package is caught even though its
-   name still resolves.
+    pakdrift --snapshot '<...>/Paks' --out pre-patch.json     # BEFORE the patch
+    pakdrift --compare-snapshot pre-patch.json '<...>/Paks'   # AFTER the patch
 
 ## The three verdicts — and the third is the point
 
-    exit 0   RESOLVES   every package the mod ships exists (name-level), or nothing changed
-                        vs the snapshot (content-level)
-    exit 1   DRIFT      at least one target is gone, or a package changed bytes / vanished
+    exit 0   RESOLVES   every package the mod ships exists in the installed game
+    exit 1   DRIFT      at least one package the mod targets is gone (or vanished vs a snapshot)
     exit 2   UNKNOWN    an input could not be read
 
 **UNKNOWN is never reported as clean.** Most tools in this space verify their own work
 internally and report success; this one refuses to answer at all when it cannot read its
 inputs, and says which of the three it did. A check that cannot fail is not a check.
 
-It also draws the honest line on what RESOLVES means: *every target is present* (name-level) or
-*nothing changed vs the snapshot* (content-level). Neither is proof the game accepts the mod —
-nothing read from a file can be.
+It also draws the honest line on what RESOLVES means: *every target is present*. That is not
+proof the game accepts the mod — nothing read from a file can be.
+
+## ★ THE HONEST LIMIT — this is a NAME/EXISTENCE compare, NOT a content compare
+
+An earlier version of this tool (v3, 2026-10-08) claimed a **content-level** mode: that a
+package keeping its name but changing its bytes could be caught via the IoStore "chunk hash".
+**That claim was measured and is FALSE, and this file is the correction.**
+
+The identifier `retoc` exposes per package (`packagedata[].id`) is the **package chunk id**,
+and its leading bytes are a hash **of the package NAME, not of its contents.** Measured proof:
+the mod `DaffodildNude` ships a package whose chunk id is `e7a48aaee5ac67…` with **5,127,072
+bytes**, while the installed game ships the **same id** with **1,122,463 bytes** — different
+bytes, identical id. So a same-id/same-hash read is **guaranteed** for any package that keeps
+its name, and can never see an internal change.
+
+**Consequence:** `--snapshot` / `--compare-snapshot` catch packages a patch **added or removed**
+(existence drift). They do **not** catch a package whose internals changed under you.
+
+**The real content compare exists** and is heavier: extract each chunk's bytes (`retoc get`) and
+compare their SHA-256. That is what a true content-level mode must do — extract, do not trust the
+id. It is stated here as the upgrade path, not as a shipped feature, because calling the id-based
+read "content-level" is exactly the green-answer-about-the-wrong-thing this tool argues against.
 
 ## What it needs
 
@@ -52,28 +67,20 @@ Measured on a real install, 2026-10-07/08 (Neverness to Everness, UE 5.6.1, 27 m
 
 | what | result |
 |---|---|
-| game package index | **250,092 packages** (names **and** content hashes) built in **5.2 s** |
+| game package index | **250,092 packages** built in ~2–5 s from the six `pakchunk*.utoc` |
 | all 27 installed mods | every one `RESOLVES` (exit 0), assets ranging 3–40 per mod |
-| **name-level negative control** | an index from the *shader chunk only* (7,558 packages); a real mod then reports **DRIFT, exit 1**, naming all five of its orphaned packages |
-| **content-level, unchanged** | snapshot vs the same game → **RESOLVES, exit 0** |
-| **content-level, changed** | one package keeps its name, its bytes change → **DRIFT, exit 1, naming it** — while the **name-level** check on the *same package* still says RESOLVES |
-| content-level, removed | a package present in the snapshot is gone now → **DRIFT, exit 1** |
-| unknown control | a missing snapshot / unreadable container → **exit 2**, never 0 |
-| self-test | `pakdrift --self-test` — **8/8**, including cases that must go red |
+| **negative control** | built an index from the *shader chunk only* (7,558 packages); a real mod then reported **DRIFT, exit 1**, naming all five of its orphaned packages |
+| existence diff | a package in the snapshot that is gone now → **DRIFT, exit 1**; unchanged → **RESOLVES, exit 0** |
+| unknown control | a missing path / unreadable container returns **exit 2**, never 0 |
+| self-test | `pakdrift --self-test` — includes cases that must go red |
 
-**The negative controls matter more than the passes.** The content-level pair (unchanged vs
-changed) is the whole reason v3 exists: it proves the tool can see drift the name-level compare
-is blind to, and that it does not cry wolf when nothing moved.
+**The negative control matters more than the passes.** It proves the tool can say no on real
+inputs, which is the only thing that makes the 27 passes mean anything.
 
 ## The honest limits
 
-- **Content-level drift needs a before/after pair.** It is only detectable against a snapshot
-  taken *before* the patch. If you never took one, `--compare-snapshot` cannot invent it — take
-  a snapshot today and the *next* patch is covered.
-- The content fingerprint is the package's IoHash. Under the container version here
-  (`ReplaceIoChunkHashWithIoHash`) that is the content hash; on an older container version it may
-  be name-derived, in which case the content-level compare degrades to no-changes rather than a
-  false positive — a known bound, not a silent one.
+- It is a **name/existence** compare (see the correction above). It catches renamed/removed
+  packages, and packages a patch added/removed. It does **not** compare asset internals.
 - `retoc`'s asset-registry parse **panics on NTE's containers** (a name-map assertion; a retoc
   0.1.5 / UE 5.6 version gap, not this tool's bug). This tool uses `retoc manifest`, which works.
 - `global.utoc` is skipped by name: it is the script-object store and holds no game packages.
